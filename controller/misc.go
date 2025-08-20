@@ -28,6 +28,8 @@ func GetStatus(c *gin.Context) {
 			"email_verification":  config.EmailVerificationEnabled,
 			"github_oauth":        config.GitHubOAuthEnabled,
 			"github_client_id":    config.GitHubClientId,
+			"linuxDo_oauth":       config.LinuxDoOAuthEnabled,
+			"linuxDo_client_id":   config.LinuxDoClientId,
 			"oidc_auth":           config.OIDCAuthEnabled,
 			"lark_login":          config.LarkAuthEnabled,
 			"lark_client_id":      config.LarkClientId,
@@ -87,10 +89,10 @@ func GetHomePageContent(c *gin.Context) {
 
 func SendEmailVerification(c *gin.Context) {
 	email := c.Query("email")
-	if err := common.Validate.Var(email, "required,email"); err != nil {
+	if err := common.ValidateEmailStrict(email); err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
-			"message": "无效的参数",
+			"message": "邮箱格式不符合要求",
 		})
 		return
 	}

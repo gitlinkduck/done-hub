@@ -3,13 +3,17 @@ package gemini
 import (
 	"done-hub/common"
 	"done-hub/common/config"
+	"done-hub/common/model_utils"
 	"done-hub/common/requester"
 	"done-hub/common/utils"
 	"done-hub/providers/base"
 	"done-hub/types"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/gin-gonic/gin"
 )
 
 const (
@@ -20,7 +24,8 @@ type GeminiStreamHandler struct {
 	Usage   *types.Usage
 	Request *types.ChatCompletionRequest
 
-	key string
+	key     string
+	Context *gin.Context // 添加 Context 用于获取响应模型名称
 }
 
 type OpenAIStreamHandler struct {
@@ -82,17 +87,16 @@ func (p *GeminiProvider) CreateChatCompletionStream(request *types.ChatCompletio
 		Usage:   p.Usage,
 		Request: request,
 
-		key: channel.Key,
+		key:     channel.Key,
+		Context: p.Context, // 传递 Context
 	}
 
 	return requester.RequestStream(p.Requester, resp, chatHandler.HandlerStream)
 }
 
 func (p *GeminiProvider) getChatRequest(geminiRequest *GeminiChatRequest, isRelay bool) (*http.Request, *types.OpenAIErrorWithStatusCode) {
-	url := "generateContent"
-	if geminiRequest.Stream {
-		url = "streamGenerateContent?alt=sse"
-	}
+	// 根据 Action 确定正确的 URL
+	url := p.getActionURL(geminiRequest)
 	// 获取请求地址
 	fullRequestURL := p.GetFullRequestURL(url, geminiRequest.Model)
 
@@ -128,6 +132,37 @@ func (p *GeminiProvider) getChatRequest(geminiRequest *GeminiChatRequest, isRela
 	return req, nil
 }
 
+// getActionURL 根据 Action 返回正确的 URL
+func (p *GeminiProvider) getActionURL(geminiRequest *GeminiChatRequest) string {
+	action := geminiRequest.Action
+	if action == "" {
+		// 默认为 generateContent
+		action = "generateContent"
+	}
+
+	// 根据不同的 action 构建 URL
+	switch action {
+	case "countTokens":
+		return "countTokens"
+	case "streamGenerateContent":
+		return "streamGenerateContent?alt=sse"
+	case "generateContent":
+		if geminiRequest.Stream {
+			return "streamGenerateContent?alt=sse"
+		}
+		return "generateContent"
+	case "predictLongRunning":
+		// Veo 3.0 视频生成
+		return "predictLongRunning"
+	default:
+		// 对于其他 action，直接使用原始值
+		if geminiRequest.Stream && !strings.Contains(action, "stream") {
+			return "stream" + strings.Title(action) + "?alt=sse"
+		}
+		return action
+	}
+}
+
 // CleanGeminiRequestData 清理 Gemini 请求数据中的不兼容字段
 func CleanGeminiRequestData(rawData []byte, isVertexAI bool) ([]byte, error) {
 	var data map[string]interface{}
@@ -137,6 +172,10 @@ func CleanGeminiRequestData(rawData []byte, isVertexAI bool) ([]byte, error) {
 
 	// 清理 contents 中的 function_call 和 function_response 字段中的 id
 	if contents, ok := data["contents"].([]interface{}); ok {
+		// 验证和修复函数调用序列
+		contents = validateAndFixFunctionCallSequence(contents, isVertexAI)
+		data["contents"] = contents
+
 		for _, content := range contents {
 			if contentMap, ok := content.(map[string]interface{}); ok {
 				if parts, ok := contentMap["parts"].([]interface{}); ok {
@@ -226,6 +265,100 @@ func CleanGeminiRequestData(rawData []byte, isVertexAI bool) ([]byte, error) {
 	return json.Marshal(data)
 }
 
+// validateAndFixFunctionCallSequence 验证和修复函数调用序列
+func validateAndFixFunctionCallSequence(contents []interface{}, isVertexAI bool) []interface{} {
+	if !isVertexAI {
+		return contents // 只对 Vertex AI 进行修复
+	}
+
+	var fixedContents []interface{}
+	functionCallCount := 0
+	functionResponseCount := 0
+
+	// 第一遍：统计函数调用和响应的数量
+	for _, content := range contents {
+		contentMap, ok := content.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		parts, _ := contentMap["parts"].([]interface{})
+
+		for _, part := range parts {
+			if partMap, ok := part.(map[string]interface{}); ok {
+				if _, exists := partMap["functionCall"]; exists {
+					functionCallCount++
+				}
+				if _, exists := partMap["function_call"]; exists {
+					functionCallCount++
+				}
+				if _, exists := partMap["functionResponse"]; exists {
+					functionResponseCount++
+				}
+				if _, exists := partMap["function_response"]; exists {
+					functionResponseCount++
+				}
+			}
+		}
+	}
+
+	// 如果函数调用和响应数量不匹配，移除所有函数调用相关内容
+	if functionCallCount != functionResponseCount {
+
+		for _, content := range contents {
+			contentMap, ok := content.(map[string]interface{})
+			if !ok {
+				fixedContents = append(fixedContents, content)
+				continue
+			}
+
+			parts, _ := contentMap["parts"].([]interface{})
+			var cleanParts []interface{}
+			hasNonFunctionContent := false
+
+			// 移除所有函数调用相关的 parts
+			for _, part := range parts {
+				if partMap, ok := part.(map[string]interface{}); ok {
+					hasFunctionCall := false
+					hasFunctionResponse := false
+
+					if _, exists := partMap["functionCall"]; exists {
+						hasFunctionCall = true
+					}
+					if _, exists := partMap["function_call"]; exists {
+						hasFunctionCall = true
+					}
+					if _, exists := partMap["functionResponse"]; exists {
+						hasFunctionResponse = true
+					}
+					if _, exists := partMap["function_response"]; exists {
+						hasFunctionResponse = true
+					}
+
+					if !hasFunctionCall && !hasFunctionResponse {
+						cleanParts = append(cleanParts, part)
+						hasNonFunctionContent = true
+					}
+				} else {
+					cleanParts = append(cleanParts, part)
+					hasNonFunctionContent = true
+				}
+			}
+
+			// 只有当有非函数内容时才添加这个 content
+			if hasNonFunctionContent && len(cleanParts) > 0 {
+				contentMap["parts"] = cleanParts
+				fixedContents = append(fixedContents, contentMap)
+			}
+		}
+	} else {
+		// 函数调用和响应匹配，保持原样
+		fixedContents = contents
+	}
+
+	return fixedContents
+}
+
 // cleanSchemaRecursively 递归清理 schema 对象中的 $schema 字段
 func cleanSchemaRecursively(obj interface{}) {
 	switch v := obj.(type) {
@@ -285,7 +418,7 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*GeminiChatReq
 		},
 	}
 
-	if strings.HasPrefix(request.Model, "gemini-2.0-flash-exp") {
+	if model_utils.HasPrefixCaseInsensitive(request.Model, "gemini-2.0-flash-exp") {
 		geminiRequest.GenerationConfig.ResponseModalities = []string{"Text", "Image"}
 	}
 
@@ -403,6 +536,20 @@ func removeAdditionalPropertiesWithDepth(schema interface{}, depth int) interfac
 	}
 
 	delete(v, "title")
+	// 删除 $schema 字段，因为 Gemini API 不支持
+	delete(v, "$schema")
+
+	// 处理format字段的限制 - Gemini API只支持STRING类型的"enum"和"date-time"格式
+	if formatVal, exists := v["format"]; exists {
+		if formatStr, ok := formatVal.(string); ok {
+			if typeVal, typeExists := v["type"]; typeExists && typeVal == "string" {
+				// 只保留Gemini支持的format
+				if formatStr != "enum" && formatStr != "date-time" {
+					delete(v, "format")
+				}
+			}
+		}
+	}
 
 	switch v["type"] {
 	case "object":
@@ -430,21 +577,46 @@ func removeAdditionalPropertiesWithDepth(schema interface{}, depth int) interfac
 }
 
 func ConvertToChatOpenai(provider base.ProviderInterface, response *GeminiChatResponse, request *types.ChatCompletionRequest) (openaiResponse *types.ChatCompletionResponse, errWithCode *types.OpenAIErrorWithStatusCode) {
+	// 获取响应中应该使用的模型名称
+	responseModel := provider.GetResponseModelName(request.Model)
+
 	openaiResponse = &types.ChatCompletionResponse{
 		ID:      response.ResponseId,
 		Object:  "chat.completion",
 		Created: utils.GetTimestamp(),
-		Model:   request.Model,
+		Model:   responseModel,
 		Choices: make([]types.ChatCompletionChoice, 0, len(response.Candidates)),
 	}
 
-	if len(response.Candidates) == 0 {
+	// 检查是否是 countTokens 请求
+	// Gemini 直连：有 UsageMetadata 且 Candidates 为空
+	// Vertex AI：有 TotalTokens 且 Candidates 为空
+	isCountTokens := len(response.Candidates) == 0 &&
+		(response.UsageMetadata != nil || response.TotalTokens > 0)
+
+	if !isCountTokens && len(response.Candidates) == 0 {
 		errWithCode = common.StringErrorWrapper("no candidates", "no_candidates", http.StatusInternalServerError)
 		return
 	}
 
-	for _, candidate := range response.Candidates {
-		openaiResponse.Choices = append(openaiResponse.Choices, candidate.ToOpenAIChoice(request))
+	// 如果是 countTokens 请求，创建一个特殊的响应
+	if isCountTokens {
+		// 为 countTokens 创建一个包含 token 信息的响应
+		openaiResponse.Choices = []types.ChatCompletionChoice{
+			{
+				Index: 0,
+				Message: types.ChatCompletionMessage{
+					Role:    types.ChatMessageRoleAssistant,
+					Content: fmt.Sprintf("Token count: %d", response.UsageMetadata.TotalTokenCount),
+				},
+				FinishReason: types.FinishReasonStop,
+			},
+		}
+	} else {
+		// 正常的 generateContent 响应处理
+		for _, candidate := range response.Candidates {
+			openaiResponse.Choices = append(openaiResponse.Choices, candidate.ToOpenAIChoice(request))
+		}
 	}
 
 	usage := provider.GetUsage()
@@ -483,11 +655,17 @@ func (h *GeminiStreamHandler) HandlerStream(rawLine *[]byte, dataChan chan strin
 }
 
 func (h *GeminiStreamHandler) convertToOpenaiStream(geminiResponse *GeminiChatResponse, dataChan chan string) {
+	// 获取响应中应该使用的模型名称
+	responseModel := h.Request.Model
+	if h.Context != nil {
+		responseModel = base.GetResponseModelNameFromContext(h.Context, h.Request.Model)
+	}
+
 	streamResponse := types.ChatCompletionStreamResponse{
 		ID:      geminiResponse.ResponseId,
 		Object:  "chat.completion.chunk",
 		Created: utils.GetTimestamp(),
-		Model:   h.Request.Model,
+		Model:   responseModel,
 		// Choices: choices,
 	}
 

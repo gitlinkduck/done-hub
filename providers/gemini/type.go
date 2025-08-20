@@ -136,6 +136,7 @@ func init() {
 type GeminiChatRequest struct {
 	Model             string                     `json:"-"`
 	Stream            bool                       `json:"-"`
+	Action            string                     `json:"-"` // 添加 Action 字段
 	Contents          []GeminiChatContent        `json:"contents"`
 	SafetySettings    []GeminiChatSafetySettings `json:"safetySettings,omitempty"`
 	GenerationConfig  GeminiChatGenerationConfig `json:"generationConfig,omitempty"`
@@ -458,6 +459,12 @@ type GeminiChatResponse struct {
 	ModelVersion   string                   `json:"modelVersion,omitempty"`
 	Model          string                   `json:"model,omitempty"`
 	ResponseId     string                   `json:"responseId,omitempty"`
+
+	// Vertex AI countTokens 响应字段
+	TotalTokens             int                          `json:"totalTokens,omitempty"`
+	TotalBillableCharacters int                          `json:"totalBillableCharacters,omitempty"`
+	PromptTokensDetails     []GeminiUsageMetadataDetails `json:"promptTokensDetails,omitempty"`
+
 	GeminiErrorResponse
 }
 
@@ -679,6 +686,15 @@ func OpenAIToGeminiChatContent(openaiContents []types.ChatCompletionMessage) ([]
 				}
 			}
 		}
+
+		// 确保每个消息至少有一个 part，避免 Gemini API 错误
+		if len(content.Parts) == 0 {
+			// 如果没有任何 parts，添加一个空文本 part
+			content.Parts = append(content.Parts, GeminiPart{
+				Text: " ", // 使用空格而不是空字符串
+			})
+		}
+
 		contents = append(contents, content)
 
 	}
@@ -758,6 +774,55 @@ type GeminiImagePrediction struct {
 	MimeType           string `json:"mimeType"`
 	RaiFilteredReason  string `json:"raiFilteredReason,omitempty"`
 	SafetyAttributes   any    `json:"safetyAttributes,omitempty"`
+}
+
+// Veo 3.0 Video Generation Types
+type VeoVideoRequest struct {
+	Instances  []VeoVideoInstance  `json:"instances"`
+	Parameters *VeoVideoParameters `json:"parameters,omitempty"`
+}
+
+type VeoVideoInstance struct {
+	Prompt string `json:"prompt"`
+}
+
+type VeoVideoParameters struct {
+	AspectRatio     string `json:"aspectRatio,omitempty"`     // e.g., "16:9"
+	NegativePrompt  string `json:"negativePrompt,omitempty"`  // e.g., "cartoon, drawing, low quality"
+	SampleCount     int    `json:"sampleCount,omitempty"`     // Number of videos to generate
+	DurationSeconds int    `json:"durationSeconds,omitempty"` // Video duration
+}
+
+// Veo 3.0 Long Running Operation Response
+type VeoLongRunningResponse struct {
+	Name     string                 `json:"name"` // Operation name for polling
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	Done     bool                   `json:"done"`
+	Response *VeoVideoResponse      `json:"response,omitempty"`
+	Error    *VeoOperationError     `json:"error,omitempty"`
+}
+
+type VeoVideoResponse struct {
+	GenerateVideoResponse *VeoGenerateVideoResponse `json:"generateVideoResponse,omitempty"`
+}
+
+type VeoGenerateVideoResponse struct {
+	GeneratedSamples []VeoGeneratedSample `json:"generatedSamples"`
+}
+
+type VeoGeneratedSample struct {
+	Video *VeoVideoData `json:"video"`
+}
+
+type VeoVideoData struct {
+	Uri      string `json:"uri"`      // Download URI
+	MimeType string `json:"mimeType"` // e.g., "video/mp4"
+}
+
+type VeoOperationError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Status  string `json:"status"`
 }
 
 func isEmptyOrOnlyNewlines(s string) bool {

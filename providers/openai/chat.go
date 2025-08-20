@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"done-hub/common"
 	"done-hub/common/config"
+	"done-hub/common/model_utils"
 	"done-hub/common/requester"
+	"done-hub/providers/base"
 	"done-hub/types"
 	"encoding/json"
 	"io"
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/gin-gonic/gin"
 )
 
 type OpenAIStreamHandler struct {
@@ -18,6 +22,7 @@ type OpenAIStreamHandler struct {
 	ModelName  string
 	isAzure    bool
 	EscapeJSON bool
+	Context    *gin.Context // 添加 Context 用于获取响应模型名称
 
 	ReasoningHandler bool
 	ExtraBilling     map[string]types.ExtraBilling `json:"-"`
@@ -78,6 +83,10 @@ func (p *OpenAIProvider) CreateChatCompletion(request *types.ChatCompletionReque
 
 	p.Usage.ExtraBilling = getChatExtraBilling(request)
 
+	// 修改响应中的模型名称为用户请求的原始模型名称
+	responseModel := p.GetResponseModelName(request.Model)
+	response.Model = responseModel
+
 	return &response.ChatCompletionResponse, nil
 }
 
@@ -125,6 +134,7 @@ func (p *OpenAIProvider) CreateChatCompletionStream(request *types.ChatCompletio
 		ModelName:  request.Model,
 		isAzure:    p.IsAzure,
 		EscapeJSON: p.StreamEscapeJSON,
+		Context:    p.Context, // 传递 Context
 
 		ExtraBilling: getChatExtraBilling(request),
 		UsageHandler: p.UsageHandler,
@@ -198,6 +208,12 @@ func (h *OpenAIStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan s
 		}
 	}
 
+	// 修改响应中的模型名称为用户请求的原始模型名称
+	if h.Context != nil {
+		responseModel := base.GetResponseModelNameFromContext(h.Context, openaiResponse.Model)
+		openaiResponse.Model = responseModel
+	}
+
 	// 始终累积流式内容到 TextBuilder，用于流中断时的 token 计算备用
 	// 即使上游返回了 Usage 信息，流中断时最终的 Usage 可能不完整
 	responseText := openaiResponse.GetResponseText()
@@ -226,16 +242,17 @@ func (h *OpenAIStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan s
 }
 
 func otherProcessing(request *types.ChatCompletionRequest, otherArg string) {
-	matched, _ := regexp.MatchString(`^o[1-9]`, request.Model)
-	if matched && request.MaxTokens > 0 {
-		request.MaxCompletionTokens = request.MaxTokens
-		request.MaxTokens = 0
-
-		if strings.HasPrefix(request.Model, "o3") {
+	matched, _ := regexp.MatchString(`(?i)^o[1-9]`, request.Model)
+	if matched || model_utils.HasPrefixCaseInsensitive(request.Model, "gpt-5") {
+		if request.MaxTokens > 0 {
+			request.MaxCompletionTokens = request.MaxTokens
+			request.MaxTokens = 0
+		}
+		if request.Model != "gpt-5-chat-latest" {
 			request.Temperature = nil
-			if otherArg != "" {
-				request.ReasoningEffort = &otherArg
-			}
+		}
+		if otherArg != "" {
+			request.ReasoningEffort = &otherArg
 		}
 	}
 }
